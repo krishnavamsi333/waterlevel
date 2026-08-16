@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Astra Water Monitor</title>
+
+<!--
+  ============================================================
+  ASTRA - Water Level Monitor, web dashboard (light theme)
+  ============================================================
+  Subscribes to the ESP32's MQTT topics over WebSocket and shows
+  the live reading. Deploy anywhere static - GitHub Pages, Netlify,
+  or just open the file locally.
+
+  IMPORTANT - why port 8084 and not 1883:
+  Browsers cannot open raw TCP sockets, so MQTT in a page always
+  goes over WebSocket. EMQX serves that on 8083 (ws) and 8084
+  (wss). The ESP32 uses 1883 because it can speak plain TCP. Same
+  broker, same topics, different transport - the broker joins them.
+
+  GitHub Pages is served over HTTPS, and a secure page may not open
+  an insecure socket. So wss:// on 8084 is required there; ws:// on
+  8083 will be blocked as mixed content. The trailing /mqtt path is
+  also required and is the usual cause of a silent connect failure.
+  ============================================================
+-->
+
+<script src="https://unpkg.com/mqtt@5.7.0/dist/mqtt.min.js"></script>
+
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+    background: #f4f6f9; color: #1b2430;
+    min-height: 100vh; display: flex; align-items: center;
+    justify-content: center; padding: 20px;
+  }
+
+  .card {
+    background: #ffffff; border: 1px solid #e2e7ee; border-radius: 14px;
+    padding: 28px; width: 100%; max-width: 420px;
+    box-shadow: 0 1px 3px rgba(20, 30, 45, .06),
+                0 8px 24px rgba(20, 30, 45, .05);
+  }
+
+  header { display: flex; justify-content: space-between;
+           align-items: center; margin-bottom: 22px; }
+
+  h1 { font-size: 13px; font-weight: 600; letter-spacing: .12em;
+       text-transform: uppercase; color: #64748b; }
+
+  #conn { font-size: 11px; color: #64748b; }
+
+  .reading { display: flex; align-items: baseline; gap: 6px; margin-bottom: 4px; }
+  #pct { font-size: 62px; font-weight: 700; line-height: 1;
+         font-variant-numeric: tabular-nums; transition: color .3s;
+         color: #1b2430; }
+  .unit { font-size: 22px; color: #94a3b8; font-weight: 600; }
+  #zone { font-size: 14px; color: #64748b; margin-bottom: 20px; }
+
+  /* The track is a touch darker than the card so an empty bar still
+     reads as a container rather than blank space. */
+  .track { height: 14px; background: #e8ecf2; border-radius: 7px;
+           overflow: hidden; margin-bottom: 22px; }
+  #bar { height: 100%; width: 0%; border-radius: 7px;
+         transition: width .5s ease, background .3s; }
+
+  .rows { border-top: 1px solid #e2e7ee; padding-top: 16px;
+          display: grid; gap: 9px; }
+  .row { display: flex; justify-content: space-between; font-size: 13px; }
+  .row span:first-child { color: #64748b; }
+  .row span:last-child { font-variant-numeric: tabular-nums; color: #334155; }
+
+  .net { margin-top: 14px; padding-top: 14px; }
+
+  .dot { display: inline-block; width: 8px; height: 8px;
+         border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
+
+  button {
+    margin-top: 20px; width: 100%; padding: 10px;
+    background: #f1f4f8; color: #334155; border: 1px solid #dde3ea;
+    border-radius: 8px; font-size: 13px; font-family: inherit;
+    cursor: pointer; transition: background .2s;
+  }
+  button:hover  { background: #e8ecf2; }
+  button:active { background: #dde3ea; }
+
+  .err { font-size: 12px; color: #b45309; background: #fff7ed;
+         border: 1px solid #fed7aa; border-radius: 8px;
+         padding: 10px 12px; margin-top: 14px;
+         line-height: 1.5; display: none; }
+</style>
+</head>
+
+<body>
+  <div class="card">
+    <header>
+      <h1>Astra Water Monitor</h1>
+      <span id="conn"><span class="dot" style="background:#94a3b8"></span>connecting</span>
+    </header>
+
+    <div class="reading">
+      <span id="pct">--</span><span class="unit">%</span>
+    </div>
+    <div id="zone">waiting for data</div>
+    <div class="track"><div id="bar"></div></div>
+
+    <div class="rows">
+      <div class="row"><span>Raw ADC</span><span id="raw">--</span></div>
+      <div class="row"><span>Sensor link</span><span id="link">--</span></div>
+      <div class="row"><span>Frames OK</span><span id="frames">--</span></div>
+      <div class="row"><span>Frames bad</span><span id="bad">--</span></div>
+      <div class="row"><span>Last message</span><span id="age">--</span></div>
+    </div>
+
+    <div class="rows net">
+      <div class="row"><span>Device</span><span id="devstatus">--</span></div>
+      <div class="row"><span>Network</span><span id="ssid">--</span></div>
+      <div class="row"><span>Signal</span><span id="rssi">--</span></div>
+      <div class="row"><span>Uptime</span><span id="uptime">--</span></div>
+    </div>
+
+    <button id="refresh">Request reading now</button>
+    <div class="err" id="err"></div>
+  </div>
+
+<script>
+/* ============================================================
+ * Configuration - must match the sketch
+ * ============================================================ */
+const BROKER = 'wss://broker.emqx.io:8084/mqtt';
+
+const TOPIC_DATA   = 'astra/monitor01/water';
+const TOPIC_STATUS = 'astra/monitor01/status';
+const TOPIC_CMD    = 'astra/monitor01/cmd';
+
+/* Client IDs must be unique across the whole broker. A fixed one
+ * collides with the ESP32 or with another browser tab, and the broker
+ * evicts both in a loop (reason code 142, "session taken over"). The
+ * random suffix makes every tab its own client. */
+const CLIENT_ID = 'astra_web_' + Math.random().toString(16).slice(2, 10);
+
+const $ = id => document.getElementById(id);
+
+let lastMessageAt = 0;
+
+
+/* ============================================================
+ * Display
+ * ============================================================ */
+
+/* Same five bands as the WS2812B zones on the STM32, so the LED, the
+ * device page, and this page always agree. The reds and blues are
+ * darkened slightly from the device palette - the originals were
+ * picked for an LED and a dark card, and wash out on white. */
+function band(p) {
+  if (p <= 20) return ['#dc2626', 'Critical - almost empty'];
+  if (p <= 40) return ['#db2777', 'Low'];
+  if (p <= 60) return ['#0284c7', 'Medium'];
+  if (p <= 80) return ['#2563eb', 'Good'];
+  return ['#16a34a', 'Full'];
+}
+
+const OK    = '#16a34a';
+const WARN  = '#d97706';
+const FAIL  = '#dc2626';
+const IDLE  = '#94a3b8';
+
+function dot(colour, label) {
+  return '<span class="dot" style="background:' + colour + '"></span>' + label;
+}
+
+function showError(msg) {
+  $('err').textContent = msg;
+  $('err').style.display = msg ? 'block' : 'none';
+}
+
+function renderReading(d) {
+  $('raw').textContent    = d.fault ? 'n/a' : d.raw;
+  $('frames').textContent = d.frames;
+  $('bad').textContent    = d.bad;
+  $('ssid').textContent   = d.ssid || '--';
+  $('rssi').textContent   = (d.rssi ?? '--') + ' dBm';
+
+  const m = Math.floor((d.uptime || 0) / 60);
+  $('uptime').textContent = m < 60
+    ? m + 'm'
+    : Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+
+  /* link=false means the ESP32 is fine but hears nothing from the
+   * STM32 - a different failure from the device being offline. */
+  if (!d.link) {
+    $('link').innerHTML  = dot(FAIL, 'down');
+    $('pct').textContent = '--';
+    $('pct').style.color = IDLE;
+    $('zone').textContent = 'No data from STM32';
+    $('bar').style.width = '0%';
+    return;
+  }
+
+  $('link').innerHTML = dot(OK, 'up');
+
+  if (d.fault) {
+    $('pct').textContent = '!';
+    $('pct').style.color = '#1b2430';
+    $('zone').textContent = 'Probe fault - check sensor wiring';
+    $('bar').style.width = '100%';
+    $('bar').style.background = '#94a3b8';
+    return;
+  }
+
+  const [colour, label] = band(d.percent);
+  $('pct').textContent  = d.percent.toFixed(1);
+  $('pct').style.color  = colour;
+  $('zone').textContent = label;
+  $('bar').style.width  = Math.max(0, Math.min(100, d.percent)) + '%';
+  $('bar').style.background = colour;
+}
+
+/* Message age is worth showing on its own: a retained payload can look
+ * current when it is actually hours old. */
+setInterval(() => {
+  if (!lastMessageAt) return;
+  const s = Math.floor((Date.now() - lastMessageAt) / 1000);
+  $('age').textContent = s < 3 ? 'just now'
+                       : s < 60 ? s + 's ago'
+                       : Math.floor(s / 60) + 'm ago';
+}, 1000);
+
+
+/* ============================================================
+ * MQTT
+ * ============================================================ */
+const client = mqtt.connect(BROKER, {
+  clientId: CLIENT_ID,
+  username: 'astra',
+  password: 'astra',
+  protocolVersion: 5,
+  clean: true,
+  connectTimeout: 8000,
+  reconnectPeriod: 4000,
+  keepalive: 60
+});
+
+client.on('connect', () => {
+  $('conn').innerHTML = dot(OK, 'broker connected');
+  showError('');
+  client.subscribe([TOPIC_DATA, TOPIC_STATUS], { qos: 0 }, err => {
+    if (err) showError('Subscribe failed: ' + err.message);
+  });
+});
+
+client.on('message', (topic, buf) => {
+  lastMessageAt = Date.now();
+
+  if (topic === TOPIC_STATUS) {
+    const online = buf.toString() === 'online';
+    $('devstatus').innerHTML = online ? dot(OK, 'online') : dot(FAIL, 'offline');
+    return;
+  }
+
+  try {
+    renderReading(JSON.parse(buf.toString()));
+  } catch (e) {
+    showError('Could not parse payload: ' + e.message);
+  }
+});
+
+client.on('reconnect', () => { $('conn').innerHTML = dot(WARN, 'reconnecting'); });
+client.on('offline',   () => { $('conn').innerHTML = dot(IDLE, 'offline'); });
+
+client.on('error', err => {
+  $('conn').innerHTML = dot(FAIL, 'error');
+
+  /* The two failures worth naming, because the generic message is
+   * useless and both have specific causes. */
+  const m = (err.message || '').toLowerCase();
+  if (m.includes('banned')) {
+    showError('Broker has temporarily banned this IP for too many ' +
+              'connection attempts. Close this tab, wait ~15 minutes, ' +
+              'then reload.');
+  } else if (m.includes('identifier')) {
+    showError('Client ID rejected. Reload to generate a new one.');
+  } else {
+    showError('Connection error: ' + err.message);
+  }
+});
+
+/* Publishing "now" makes the device send immediately rather than
+ * waiting out its 2 s interval. */
+$('refresh').addEventListener('click', () => {
+  if (!client.connected) { showError('Not connected to the broker.'); return; }
+  client.publish(TOPIC_CMD, 'now');
+});
+</script>
+</body>
+</html>
