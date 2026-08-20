@@ -36,6 +36,29 @@
 #include <esp_task_wdt.h>
 #include <time.h>
 
+/* ============================================================
+ * Log entry type - declared FIRST, on purpose
+ * ============================================================
+ * The Arduino IDE generates prototypes for every function and
+ * inserts them near the top of the file. Any function taking a
+ * LogEntry must therefore see the type before that insertion point,
+ * or the build fails with "'LogEntry' does not name a type" pointing
+ * at the function definition rather than the real cause.
+ *
+ * Packed to 9 bytes so 2880 of them fit in ~26 KB. Each byte added
+ * here costs 2.8 KB of RAM, so add fields deliberately. */
+struct __attribute__((packed)) LogEntry {
+  uint32_t stamp;      /* epoch if LF_HAS_EPOCH set, else seconds up */
+  uint16_t raw;
+  uint16_t tenths;     /* inches x 10 - derived once, at log time    */
+  uint8_t  flags;
+};
+
+#define LF_FAULT      0x01
+#define LF_SENT       0x02
+#define LF_HAS_EPOCH  0x04
+
+
 /* ---------------- WiFi ---------------- */
 const char *WIFI_SSID = "esp";
 const char *WIFI_PASS = "12345678";
@@ -76,27 +99,61 @@ const char *PORTAL_PROBE = "http://clients3.google.com/generate_204";
 #define LINK_TIMEOUT_MS       5000
 
 /* ---------------- depth scale ----------------
- * Depth is now derived here, from the raw ADC count the STM32 sends.
- * ADC_EMPTY is the count with the probe dry, ADC_FULL the count at
- * PROBE_FULL_INCHES of submersion. Measure both on the bench and put
- * the numbers here - the percent field in the frame is kept only for
- * display and cross-checking.
+ * Measured band table, not a straight line. Each band is a range of
+ * raw counts that corresponds to a whole inch on the probe:
  *
- * Inverted probes (count falls as water rises) work too: put the
- * larger number in ADC_EMPTY. The mapping below handles both. */
-#define ADC_EMPTY             400
-#define ADC_FULL              1600
+ *     350 - 400   ->  1 in        1290 - 1336  ->  6 in
+ *     620 - 670   ->  2 in        1406 - 1430  ->  7 in
+ *     840 - 900   ->  3 in        1490 - 1522  ->  8 in
+ *    1030 - 1071  ->  4 in        1560 - 1590  ->  9 in
+ *    1160 - 1210  ->  5 in        1600 and up  -> 10 in
+ *
+ * The bands do not touch - 400 to 620 is a gap, and so is every step
+ * after it. That is normal for a resistive ladder probe: the count
+ * moves fast as a segment wets and slowly once it is covered.
+ *
+ * Counts landing in a gap are interpolated between the two
+ * neighbouring inches rather than snapped to one of them. Snapping
+ * would make the gauge jump 1 to 2 with nothing in between, which
+ * looks exactly like a sensor that has stopped responding. */
+struct InchBand { uint16_t lo; uint16_t hi; uint8_t inches; };
+
+static const InchBand INCH_BANDS[] = {
+  {  350,  400,  1 },
+  {  620,  670,  2 },
+  {  840,  900,  3 },
+  { 1030, 1071,  4 },
+  { 1160, 1210,  5 },
+  { 1290, 1336,  6 },
+  { 1406, 1430,  7 },
+  { 1490, 1522,  8 },
+  { 1560, 1590,  9 },
+  { 1600, 4095, 10 }
+};
+#define BAND_COUNT  (sizeof(INCH_BANDS) / sizeof(INCH_BANDS[0]))
+
+/* Count at which the probe reads zero inches. Below the first band,
+ * depth interpolates from here up to 1 inch at 350. */
+#define ADC_ZERO              250
+
 #define PROBE_FULL_INCHES     10.0f
 
-/* Counts this far outside the window mean an open or shorted probe
- * rather than a wet or dry one. Clamped readings are still shown,
- * but flagged so you notice. */
+/* A count this far below ADC_ZERO is an open or shorted probe rather
+ * than a dry one. Flagged on the page, not silently clamped. */
 #define ADC_SANITY_MARGIN     150
 
 /* ---------------- logging ---------------- */
-#define LOG_SIZE              25          /* samples retained      */
-#define LOG_INTERVAL_MS       3600000UL   /* one hour              */
-#define QUEUE_FILE            "/queue.csv"
+/* 2880 samples held in RAM. At 30s spacing that is exactly 24 hours;
+ * at 60s it is 48. Pick the interval for the window you want.
+ *
+ * The entry struct is packed to 9 bytes precisely so this fits: 2880
+ * x 9 = ~26 KB, which the ESP32 can carry alongside WiFi and TLS.
+ * The unpacked struct this replaces was 20 bytes and would have cost
+ * 58 KB, which it cannot. */
+#define LOG_SIZE              2880
+#define LOG_INTERVAL_MS       30000UL     /* 30s -> 24h of history */
+#define LOG_VIEW              60          /* rows sent to the page */
+#define QUEUE_FILE            "/queue.bin"
 
 /* ---------------- watchdog ---------------- */
 #define WDT_TIMEOUT_MS        30000
@@ -216,26 +273,16 @@ unsigned long lastPushTry  = 0;
 bool          fsReady      = false;
 
 /* ---------------- log ring buffer ----------------
- * Fixed 25 slots in RAM. When full, the oldest entry is overwritten,
- * so the buffer always holds the most recent 25 hours.
+ * LOG_SIZE slots in RAM. When full the oldest entry is overwritten,
+ * so the buffer always holds the most recent LOG_SIZE samples - 24
+ * hours at the default 30s spacing.
  *
- * It is now also the retry queue: `sent` stays false until Sheets
- * accepts the row. A mirror lives in LittleFS at one write per hour,
- * which is roughly 8,700 writes a year against a 100,000 cycle
- * rating - fine. The once-per-second live reading still never
- * touches flash. */
-struct LogEntry {
-  time_t   epoch;      /* 0 if clock was never synced */
-  uint32_t uptimeSec;
-  float    inches;
-  uint16_t raw;
-  bool     fault;
-  bool     sent;
-};
-
+ * It is also the retry queue: LF_SENT stays clear until Sheets
+ * accepts the row. Only unsent rows are mirrored to LittleFS; see
+ * the persistence section for why the whole ring is not. */
 LogEntry      logBuf[LOG_SIZE];
-uint8_t       logHead   = 0;     /* next slot to write */
-uint8_t       logCount  = 0;
+uint16_t      logHead   = 0;     /* next slot to write */
+uint16_t      logCount  = 0;
 unsigned long lastLogMs = 0;
 bool          firstLogDone = false;
 
@@ -249,21 +296,48 @@ bool pushEntry(LogEntry &e);
 
 float inchesFromRaw(uint16_t raw, bool &outOfRange)
 {
-  const float lo = (float) ADC_EMPTY;
-  const float hi = (float) ADC_FULL;
-  const float span = hi - lo;
+  outOfRange = false;
 
-  if (span == 0.0f) { outOfRange = true; return 0.0f; }
+  /* At or past the top band - the probe is fully covered and cannot
+   * report more, so this is a ceiling, not a measurement. */
+  if (raw >= INCH_BANDS[BAND_COUNT - 1].lo) return PROBE_FULL_INCHES;
 
-  float f = ((float) raw - lo) / span;   /* 0 = empty, 1 = full */
+  /* Inside a band: the measured whole inch, exactly as calibrated. */
+  for (uint8_t i = 0; i < BAND_COUNT; i++)
+  {
+    if (raw >= INCH_BANDS[i].lo && raw <= INCH_BANDS[i].hi)
+      return (float) INCH_BANDS[i].inches;
+  }
 
-  float margin = ADC_SANITY_MARGIN / fabsf(span);
-  outOfRange = (f < -margin) || (f > 1.0f + margin);
+  /* Below the first band: interpolate ADC_ZERO -> 0 in, 350 -> 1 in. */
+  if (raw < INCH_BANDS[0].lo)
+  {
+    if (raw <= ADC_ZERO)
+    {
+      outOfRange = (raw + ADC_SANITY_MARGIN < ADC_ZERO);
+      return 0.0f;
+    }
+    float f = (float)(raw - ADC_ZERO) /
+              (float)(INCH_BANDS[0].lo - ADC_ZERO);
+    return f * (float) INCH_BANDS[0].inches;
+  }
 
-  if (f < 0.0f) f = 0.0f;
-  if (f > 1.0f) f = 1.0f;
+  /* In a gap between two bands: interpolate across it, so the gauge
+   * moves continuously instead of stepping. */
+  for (uint8_t i = 0; i + 1 < BAND_COUNT; i++)
+  {
+    uint16_t gapLo = INCH_BANDS[i].hi;
+    uint16_t gapHi = INCH_BANDS[i + 1].lo;
 
-  return f * PROBE_FULL_INCHES;
+    if (raw > gapLo && raw < gapHi)
+    {
+      float f = (float)(raw - gapLo) / (float)(gapHi - gapLo);
+      return (float) INCH_BANDS[i].inches +
+             f * (float)(INCH_BANDS[i + 1].inches - INCH_BANDS[i].inches);
+    }
+  }
+
+  return 0.0f;   /* unreachable with a sane table */
 }
 
 
@@ -275,19 +349,21 @@ void addLogEntry()
 {
   LogEntry &e = logBuf[logHead];
 
-  e.epoch     = timeSynced ? time(nullptr) : 0;
-  e.uptimeSec = millis() / 1000UL;
-  e.inches    = waterInches;
-  e.raw       = waterRaw;
-  e.fault     = probeFault;
-  e.sent      = false;
+  bool haveClock = timeSynced && (time(nullptr) > 1600000000);
+
+  e.stamp  = haveClock ? (uint32_t) time(nullptr)
+                       : (uint32_t)(millis() / 1000UL);
+  e.raw    = waterRaw;
+  e.tenths = (uint16_t)(waterInches * 10.0f + 0.5f);
+  e.flags  = (probeFault ? LF_FAULT : 0) | (haveClock ? LF_HAS_EPOCH : 0);
 
   logHead = (logHead + 1) % LOG_SIZE;
   if (logCount < LOG_SIZE) logCount++;
 
   lastLogMs = millis();
 
-  LOG.printf("[LOG] Sample %.1f in  (%u held)\n", e.inches, logCount);
+  LOG.printf("[LOG] Sample %.1f in  (%u of %u held)\n",
+             e.tenths / 10.0f, logCount, (unsigned) LOG_SIZE);
 
   saveQueue();
 
@@ -302,47 +378,61 @@ void addLogEntry()
 
 
 /* Oldest slot index in write order. */
-uint8_t oldestIdx()
+uint16_t oldestIdx()
 {
-  return (uint8_t)(((int) logHead - (int) logCount + LOG_SIZE * 2) % LOG_SIZE);
+  return (uint16_t)((logHead + LOG_SIZE - logCount) % LOG_SIZE);
 }
 
 
-/* Newest first, since that is the order you read a log in. */
-String logAsJson()
+void stampLabel(const LogEntry &e, char *out, size_t len)
+{
+  if (e.flags & LF_HAS_EPOCH)
+  {
+    time_t    t = (time_t) e.stamp;
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    strftime(out, len, "%d %b %H:%M:%S", &tmv);
+  }
+  else
+  {
+    /* No clock: time since boot, still ordered and still correctly
+     * spaced, just not wall-clock. */
+    snprintf(out, len, "+%luh%02lum%02lus",
+             (unsigned long)(e.stamp / 3600UL),
+             (unsigned long)((e.stamp % 3600UL) / 60UL),
+             (unsigned long)(e.stamp % 60UL));
+  }
+}
+
+
+/* Newest first, since that is the order you read a log in.
+ *
+ * Only the newest `limit` rows go to the page. Serialising all 2880
+ * would be a ~250 KB JSON string built in RAM once per second, which
+ * would fragment the heap and stall the server. The full set is
+ * available as a stream at /log.csv instead. */
+String logAsJson(uint16_t limit)
 {
   String out = "[";
 
-  for (uint8_t i = 0; i < logCount; i++)
-  {
-    /* Walk backwards from the most recently written slot. */
-    int idx = (int) logHead - 1 - (int) i;
-    while (idx < 0) idx += LOG_SIZE;
+  uint16_t shown = (logCount < limit) ? logCount : limit;
+  out.reserve(shown * 72 + 16);
 
+  for (uint16_t i = 0; i < shown; i++)
+  {
+    uint16_t idx = (uint16_t)((logHead + LOG_SIZE - 1 - i) % LOG_SIZE);
     const LogEntry &e = logBuf[idx];
 
-    char label[24];
-    if (e.epoch > 1600000000)
-    {
-      struct tm tmv;
-      localtime_r(&e.epoch, &tmv);
-      strftime(label, sizeof(label), "%d %b %H:%M", &tmv);
-    }
-    else
-    {
-      /* No clock: fall back to time since boot, which is still
-       * ordered and still shows the spacing. */
-      snprintf(label, sizeof(label), "+%luh%02lum",
-               (unsigned long)(e.uptimeSec / 3600UL),
-               (unsigned long)((e.uptimeSec % 3600UL) / 60UL));
-    }
+    char label[28];
+    stampLabel(e, label, sizeof(label));
 
     char item[128];
     snprintf(item, sizeof(item),
              "%s{\"t\":\"%s\",\"in\":%.1f,\"raw\":%u,\"f\":%s,\"s\":%s}",
-             (i == 0 ? "" : ","), label, e.inches,
-             (unsigned) e.raw, e.fault ? "true" : "false",
-             e.sent ? "true" : "false");
+             (i == 0 ? "" : ","), label, e.tenths / 10.0f,
+             (unsigned) e.raw,
+             (e.flags & LF_FAULT) ? "true" : "false",
+             (e.flags & LF_SENT)  ? "true" : "false");
     out += item;
   }
 
@@ -351,14 +441,14 @@ String logAsJson()
 }
 
 
-uint8_t unsentCount()
+uint16_t unsentCount()
 {
-  uint8_t n = 0;
-  for (uint8_t i = 0; i < logCount; i++)
-  {
-    uint8_t idx = (uint8_t)((oldestIdx() + i) % LOG_SIZE);
-    if (!logBuf[idx].sent) n++;
-  }
+  uint16_t n = 0;
+  uint16_t base = oldestIdx();
+
+  for (uint16_t i = 0; i < logCount; i++)
+    if (!(logBuf[(base + i) % LOG_SIZE].flags & LF_SENT)) n++;
+
   return n;
 }
 
@@ -366,24 +456,37 @@ uint8_t unsentCount()
 /* ============================================================
  * Queue persistence (LittleFS)
  * ============================================================
- * One line per held sample, oldest first. Written once per log, i.e.
- * hourly, so wear is a non-issue. Restored on boot marked exactly as
- * it was saved, so a power cut mid-outage does not lose the backlog.
+ * Only UNSENT entries are written, not the whole 26 KB ring.
+ *
+ * That is the difference between a file that is usually a few dozen
+ * bytes and one that is 26 KB written every 30 seconds - which would
+ * be ~75 MB a day through a 1.4 MB partition and would wear it out
+ * inside a year. The history is a RAM cache and is expected to clear
+ * on reboot; the send queue is the part that must survive, because
+ * losing it means losing rows the sheet never got.
  */
 
 void saveQueue()
 {
   if (!fsReady) return;
 
+  uint16_t pending = unsentCount();
+
+  if (pending == 0)
+  {
+    if (LittleFS.exists(QUEUE_FILE)) LittleFS.remove(QUEUE_FILE);
+    return;
+  }
+
   File f = LittleFS.open(QUEUE_FILE, "w");
   if (!f) { LOG.println("[LFS] Queue write failed."); return; }
 
-  for (uint8_t i = 0; i < logCount; i++)
+  uint16_t base = oldestIdx();
+  for (uint16_t i = 0; i < logCount; i++)
   {
-    const LogEntry &e = logBuf[(oldestIdx() + i) % LOG_SIZE];
-    f.printf("%ld,%lu,%.2f,%u,%u,%u\n",
-             (long) e.epoch, (unsigned long) e.uptimeSec, e.inches,
-             (unsigned) e.raw, e.fault ? 1u : 0u, e.sent ? 1u : 0u);
+    const LogEntry &e = logBuf[(base + i) % LOG_SIZE];
+    if (e.flags & LF_SENT) continue;
+    f.write((const uint8_t *) &e, sizeof(LogEntry));
   }
   f.close();
 }
@@ -398,25 +501,13 @@ void loadQueue()
 
   logHead = logCount = 0;
 
-  while (f.available() && logCount < LOG_SIZE)
+  LogEntry e;
+  while (f.available() >= (int) sizeof(LogEntry) && logCount < LOG_SIZE)
   {
-    String line = f.readStringUntil('\n');
-    line.trim();
-    if (line.length() < 9) continue;
+    if (f.read((uint8_t *) &e, sizeof(LogEntry)) != sizeof(LogEntry)) break;
 
-    long  ep; unsigned long up; float in;
-    unsigned rawv, flt, snt;
-
-    if (sscanf(line.c_str(), "%ld,%lu,%f,%u,%u,%u",
-               &ep, &up, &in, &rawv, &flt, &snt) != 6) continue;
-
-    LogEntry &e = logBuf[logHead];
-    e.epoch     = (time_t) ep;
-    e.uptimeSec = (uint32_t) up;
-    e.inches    = in;
-    e.raw       = (uint16_t) rawv;
-    e.fault     = flt != 0;
-    e.sent      = snt != 0;
+    e.flags &= ~LF_SENT;              /* it was queued; it still is */
+    logBuf[logHead] = e;
 
     logHead = (logHead + 1) % LOG_SIZE;
     logCount++;
@@ -426,9 +517,9 @@ void loadQueue()
   if (logCount)
   {
     firstLogDone = true;
-    lastLogMs    = millis();     /* next sample an hour from boot */
-    LOG.printf("[LFS] Restored %u samples, %u unsent.\n",
-                  logCount, unsentCount());
+    lastLogMs    = millis();
+    LOG.printf("[LFS] Restored %u unsent rows from before the reboot.\n",
+               logCount);
   }
 }
 
@@ -684,17 +775,20 @@ bool pushEntry(LogEntry &e)
 #if !PUSH_ENABLED
   return false;
 #else
-  if (e.sent) return true;
+  if (e.flags & LF_SENT) return true;
   if (WiFi.status() != WL_CONNECTED || !internetOk) return false;
+
+  float in = e.tenths / 10.0f;
 
   char url[420];
   snprintf(url, sizeof(url),
            "%s?pipe_height=%.2f&inches=%.2f&percent=%.1f&raw=%u"
-           "&fault=%u&epoch=%ld&uptime=%lu",
-           SHEETS_URL, e.inches, e.inches,
-           (e.inches / PROBE_FULL_INCHES) * 100.0f,
-           (unsigned) e.raw, e.fault ? 1u : 0u,
-           (long) e.epoch, (unsigned long) e.uptimeSec);
+           "&fault=%u&epoch=%lu&uptime=%lu",
+           SHEETS_URL, in, in,
+           (in / PROBE_FULL_INCHES) * 100.0f,
+           (unsigned) e.raw, (e.flags & LF_FAULT) ? 1u : 0u,
+           (e.flags & LF_HAS_EPOCH) ? (unsigned long) e.stamp : 0UL,
+           (e.flags & LF_HAS_EPOCH) ? 0UL : (unsigned long) e.stamp);
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -716,10 +810,10 @@ bool pushEntry(LogEntry &e)
 
   if (code == 200)
   {
-    e.sent = true;
+    e.flags |= LF_SENT;
     pushOk++;
     pushNote = "accepted";
-    LOG.printf("[HTTP] Sheets accepted %.1f in\n", e.inches);
+    LOG.printf("[HTTP] Sheets accepted %.1f in\n", in);
     return true;
   }
 
@@ -747,11 +841,13 @@ void flushQueue()
   if (!internetOk) { internetOk = checkInternet(); if (!internetOk) return; }
   if (unsentCount() == 0) return;
 
-  uint8_t done = 0, changed = 0;
-  for (uint8_t i = 0; i < logCount && done < PUSH_MAX_PER_SWEEP; i++)
+  uint16_t done = 0, changed = 0;
+  uint16_t base = oldestIdx();
+
+  for (uint16_t i = 0; i < logCount && done < PUSH_MAX_PER_SWEEP; i++)
   {
-    LogEntry &e = logBuf[(oldestIdx() + i) % LOG_SIZE];
-    if (e.sent) continue;
+    LogEntry &e = logBuf[(base + i) % LOG_SIZE];
+    if (e.flags & LF_SENT) continue;
 
     done++;
     if (pushEntry(e)) changed++;
@@ -902,7 +998,7 @@ button:focus-visible{outline:2px solid var(--water);outline-offset:2px}
     </div>
 
     <div class="card">
-      <h2>Hourly log &mdash; last 25</h2>
+      <h2>Sample log</h2>
       <table>
         <thead>
           <tr><th>Time</th><th class="n">Depth</th><th class="n">Raw</th>
@@ -928,8 +1024,9 @@ button:focus-visible{outline:2px solid var(--water);outline-offset:2px}
       </div>
 
       <div class="foot">
-        <span class="hint">Samples every hour. Oldest drops off at 25.</span>
+        <span class="hint" id="cap">&nbsp;</span>
         <div class="btns">
+          <a href="/log.csv" download><button>Download all as CSV</button></a>
           <button id="send">Send queued rows</button>
           <button id="now">Log a sample now</button>
         </div>
@@ -1006,7 +1103,10 @@ async function tick() {
       d.net + (d.open ? ' \u00b7 open network' : '') +
       (d.netup && !d.online ? ' \u00b7 no route out' : '');
     document.getElementById('clock').textContent = d.time || '';
-    document.getElementById('held').textContent = d.held + ' / 25';
+    document.getElementById('held').textContent = d.held + ' / ' + d.cap;
+    document.getElementById('cap').textContent =
+      'Showing the newest ' + d.shown + ' of ' + d.held +
+      ' held. Oldest drops off at ' + d.cap + '.';
     document.getElementById('ok').textContent   = d.frames;
     document.getElementById('bad').textContent  = d.bad;
     document.getElementById('raw').textContent  = d.fault ? '\u2014' : d.raw;
@@ -1134,7 +1234,7 @@ void handleData()
            "\"age_ms\":%lu,\"held\":%u,\"net\":\"%s\",\"open\":%s,"
            "\"netup\":%s,\"online\":%s,\"push_on\":%s,\"queued\":%u,"
            "\"push_ok\":%u,\"push_fail\":%u,\"push_note\":\"%s\","
-           "\"time\":\"%s\",\"log\":",
+           "\"cap\":%u,\"shown\":%u,\"time\":\"%s\",\"log\":",
            waterInches, waterPercent, stmPercent, (unsigned) waterRaw,
            up ? "true" : "false",
            probeFault ? "true" : "false",
@@ -1150,9 +1250,11 @@ void handleData()
            (unsigned) unsentCount(),
            (unsigned) pushOk, (unsigned) pushFail,
            pushNote.c_str(),
+           (unsigned) LOG_SIZE,
+           (unsigned)(logCount < LOG_VIEW ? logCount : LOG_VIEW),
            clockStr);
 
-  String json = String(head) + logAsJson() + "}";
+  String json = String(head) + logAsJson(LOG_VIEW) + "}";
 
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", json);
@@ -1174,6 +1276,49 @@ void handlePushNow()
   lastPushTry = 0;
   flushQueue();
   server.send(200, "text/plain", pushNote.c_str());
+}
+
+
+/* Full history as a stream. Built in ~1 KB chunks rather than one
+ * String, because a 2880-row CSV is around 130 KB and assembling
+ * that in RAM would fail on a device that also holds a 26 KB ring
+ * and a TLS session. */
+void handleLogCsv()
+{
+  server.sendHeader("Content-Disposition",
+                    "attachment; filename=waterlevel.csv");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/csv", "");
+  server.sendContent("time,inches,raw,fault,sent\n");
+
+  String chunk;
+  chunk.reserve(1200);
+
+  uint16_t base = oldestIdx();
+  for (uint16_t i = 0; i < logCount; i++)
+  {
+    const LogEntry &e = logBuf[(base + i) % LOG_SIZE];
+
+    char label[28];
+    stampLabel(e, label, sizeof(label));
+
+    char line[80];
+    snprintf(line, sizeof(line), "%s,%.1f,%u,%u,%u\n",
+             label, e.tenths / 10.0f, (unsigned) e.raw,
+             (e.flags & LF_FAULT) ? 1u : 0u,
+             (e.flags & LF_SENT)  ? 1u : 0u);
+    chunk += line;
+
+    if (chunk.length() > 1024)
+    {
+      server.sendContent(chunk);
+      chunk = "";
+      esp_task_wdt_reset();
+    }
+  }
+
+  if (chunk.length()) server.sendContent(chunk);
+  server.sendContent("");
 }
 
 
@@ -1216,6 +1361,7 @@ void setup()
   server.on("/lognow",  handleLogNow);
   server.on("/pushnow", handlePushNow);
   server.on("/syslog",  handleSysLog);
+  server.on("/log.csv", handleLogCsv);
   server.begin();
   LOG.println("[HTTP] Dashboard running.");
 }
@@ -1297,23 +1443,38 @@ void loop()
  * ============================================================
  *
  * ADC SCALE
- *   ADC_EMPTY 400 / ADC_FULL 1600 is now the single source of truth
- *   for depth. The STM32's percent field is kept as stm_percent in
- *   /data purely so you can see the two disagree if the STM32 side is
- *   calibrated differently - it no longer affects the reading, so
- *   PROBE_FULL_INCHES only has to match the depth at which 1600 was
- *   measured. Measure both numbers with the probe dry and at that
- *   depth; do not take them from a datasheet.
+ *   INCH_BANDS is the single source of truth for depth. Inside a
+ *   band the reading is the calibrated whole inch; in a gap it is
+ *   interpolated across to the next one, so the gauge moves smoothly
+ *   rather than jumping. Above 1600 it reports 10 in - that is the
+ *   probe running out of trace, not the tank running out of room.
  *
- *   Counts more than ADC_SANITY_MARGIN outside the window are clamped
- *   and flagged on the page. That usually means an open probe, a
- *   shorted probe, or a supply that has sagged - not water.
+ *   The STM32's percent field is still parsed and exposed as
+ *   stm_percent in /data purely as a cross-check. It no longer
+ *   affects anything, so the STM32's own ADC_DRY/ADC_WET only need
+ *   to be right for the LED colours.
  *
- *   Resistive probes have only a few inches of sensing trace. A 0-10
- *   inch scale assumes the probe is mounted so its span covers the
- *   range you care about, and that you accept the number as
- *   indicative. It is not a 0.1 inch instrument, whatever the display
- *   resolution suggests.
+ *   Counts more than ADC_SANITY_MARGIN below ADC_ZERO are flagged on
+ *   the page as out of range. That is an open or shorted probe, or a
+ *   sagging supply - not a dry tank.
+ *
+ * HISTORY BUFFER
+ *   2880 entries at 30s = 24 hours, in ~26 KB of RAM. The struct is
+ *   packed to 9 bytes to make that fit; do not add fields to it
+ *   casually, since each extra byte costs 2.8 KB.
+ *
+ *   The page is only sent the newest LOG_VIEW rows. Serialising all
+ *   2880 as JSON would be a ~250 KB string built once per second,
+ *   which fragments the heap and stalls the server. Use the CSV
+ *   download for the full set - it streams in 1 KB chunks and never
+ *   holds more than that in RAM.
+ *
+ *   This is a RAM cache and clears on reboot, by design. Only the
+ *   unsent queue is persisted, because that is the part whose loss
+ *   is not recoverable. Mirroring all 26 KB every 30 seconds would
+ *   push ~75 MB a day through a 1.4 MB flash partition and wear it
+ *   out within a year, to protect data that is already in a
+ *   spreadsheet.
  *
  * CLOUD PUSH
  *   Set SHEETS_URL to your Apps Script deployment. The script needs a
