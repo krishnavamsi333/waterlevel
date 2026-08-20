@@ -42,8 +42,8 @@
  * ADC_DRY = averaged raw with the probe completely dry.
  * ADC_WET = averaged raw at your maximum useful depth.
  * See the calibration procedure at the bottom. */
-#define ADC_DRY           400
-#define ADC_WET           1500
+#define ADC_DRY           450
+#define ADC_WET           1800
 
 /* A reading this far below the dry baseline means the signal wire is
  * open or the probe has come loose. Tune to your measured ADC_DRY. */
